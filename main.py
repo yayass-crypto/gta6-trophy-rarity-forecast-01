@@ -1,53 +1,63 @@
-"""Forecast GTA VI trophy earn rates on Exophase at a case's target.
+"""Forecast GTA VI trophy earn rates on Exophase at each case's target.
 
-Approach
---------
-Each trophy's earn rate is modelled on the logit scale against
-x = ln(1 + hours since release), fitted by least squares over the case's
-distinct snapshots (see below), and read at the target:
+Method in brief
+---------------
+For every trophy we model its earn rate on the logit scale as a straight
+line in x = ln(1 + hours since release), fitted by least squares over the
+case's distinct page states, and read the line at the target instant:
 
-* The logit scale is the right scale for a rate: it is self-damping over
-  a long horizon (a rate can approach 100% but never pass it), where
-  dividing two separately extrapolated exponential counts proved
-  fragile -- small slope errors in earners and in players tracked
-  compound into rates of several hundred percent.  Both shapes were
-  tested on the practice cases and on a synthetic final-like case; the
-  logit-rate fit won clearly on both, so it is the median model here.
-* The fit is recency-weighted (weights 0.7 per snapshot of age): the
-  launch ramp is a different regime from the current one, so recent
-  refreshes carry more weight.
-* The fitted move is damped toward persistence.  A linear trend in x
-  cannot hold forever -- progression saturates -- so the logit move from
-  the last rate to the fitted target value is multiplied by
-  (1 - exp(-dx)) / dx, where dx is the log-time distance to the target.
-  The factor is 1 for a vanishing horizon and decays toward 0 for a very
-  long one: the trend is believed in full over short hops and only in
-  part over four days.
-* A trophy showing 0.00% in the last snapshot is a late trophy that has
-  not started yet, not a dead one: it gets a small horizon-scaled prior
+* Logit, not counts.  A rate lives between 0 and 100, and the logit scale
+  enforces that on its own: a fitted line can push a rate toward 100%
+  but never past it.  An earlier design split each rate into two
+  exponentials (earners over players tracked) and divided them; it was
+  tried on the practice cases and on a synthetic final-like case and
+  lost clearly on both, because a small slope error in either count
+  compounds into a rate of several hundred percent.  The logit-rate fit
+  is the median model here.
+* Recency-weighted.  A snapshot k steps back from the latest carries
+  weight 0.7**k: the launch-night ramp is a different regime from the
+  current one, so recent refreshes speak louder.
+* Saturating damping.  A straight line in log-time cannot run forever --
+  progression flattens out -- so the logit move from the last observed
+  rate to the fitted target value is multiplied by (1 - exp(-dx)) / dx,
+  with dx the log-time distance to the target.  The factor is 1 for a
+  vanishing hop and fades toward 0 over a long one: the trend is trusted
+  in full over hours and only in part over four days.
+* A trophy at 0.00% in the last snapshot is a late trophy that has not
+  started yet, not a dead one: it gets a small horizon-scaled prior
   median (about 1% over a 4.5-day horizon, the low end of the rarest
-  trophies that have already started) with a very wide spread.
-* A trophy whose last rate is (nearly) 100% keeps median 99.9 with a
-  tight spread: everyone earns it on starting.
+  trophies that have already started) and a very wide spread.
+* A trophy at (nearly) 100% stays there with a tight spread: everybody
+  earns it just by starting the game.  If the last rate is essentially
+  100% (>= 99.95) and that reading is corroborated -- the trophy held
+  >= 99.5 in at least two distinct snapshots, or, when the history is a
+  single frozen page, in at least two reads of that page -- the median
+  is 99.99, the scorer's clamp ceiling, because the recovered practice
+  answer for the one such trophy is exactly 100%.  A lone uncorroborated
+  reading can never trigger the 99.99 median; the 99.5-99.95 band keeps
+  median 99.9.
 
-Exophase refreshes its page infrequently, so a case's history is first
+Exophase refreshes its page rarely, so a case's history is first
 collapsed to distinct snapshots (identical page states collapse to one);
-fitting the raw reads would overweight long flat stretches.
+fitting the raw reads would let long flat stretches dominate the fit.
 
 Flat-history branch: when the history holds only one distinct snapshot
 there is no trend to fit.  The page is stale while a blockbuster launch
 keeps adding players, so the next refresh dilutes rates: the median is
-shifted down by the DILUTION_PRIOR (0.35 -- new players roughly tripling
-while earners grow roughly 15%) and a wide spread is used.  This branch
-fires only on a single distinct snapshot, never when a real trend exists.
+shifted down by DILUTION_PRIOR (0.35 -- new players roughly tripling
+while earners grow roughly 15%) with a wide spread.  This branch fires
+only on a single distinct snapshot, never when a real trend exists.
 
 Spread: per trophy, sigma on the logit scale combines a random-walk term
 (0.5 * sqrt(horizon in days), the house baseline's term), the residual
 variance of the logit fit (scaled by how far the target extrapolates
 past the fitted range), and a staleness term that grows when the last
 distinct snapshot is old relative to the usual gap between snapshots.
-Sigma is clamped to [0.35, 1.3] in the trend branch (the zero-rate and
-fallback branches use their own wider 1.6).
+When distinct snapshots are few (< 6), the trend fit rests on little
+evidence, so the spread is widened: the sigma cap rises from 1.3 to 2.0
+and a small-sample variance term proportional to 1 / n_snapshots is
+added.  Sigma is clamped to [0.35, cap] in the trend branch (the
+zero-rate and fallback branches use their own wider 1.6).
 
 Quantiles use the standard-normal z values, are rounded half-up to 4
 decimals, clamped to [0.01, 99.99] and sorted non-decreasing as a guard.
@@ -74,9 +84,24 @@ DILUTION_PRIOR = 0.35
 # Spread used in the flat-history branch (logit units).
 FLAT_SIGMA = 1.0
 
-# Sigma clamp for the trend branch (logit units).
+# Sigma clamp for the trend branch (logit units).  The cap is raised when
+# distinct snapshots are few (see SPARSE_* below).
 SIGMA_MIN = 0.35
 SIGMA_MAX = 1.3
+
+# Sparse-history widening: with fewer than SPARSE_LIMIT distinct
+# snapshots the trend fit is noisy, so the sigma cap rises to
+# SIGMA_MAX_SPARSE and a variance term SMALL_SAMPLE_COEF / n_snapshots
+# is added.  A 12-hour refresh cadence leaves only ~5 distinct snapshots
+# by the checkpoint; without this the 90% band covers only ~0.82 there.
+# Measured on that world: cap 1.6/coef 1.0 gives loss 0.7914, coverage
+# 0.85; cap 2.0/coef 1.0 gives 0.7900 / 0.87; caps 2.5 and 3.0 stay at
+# 0.87 while loss stops improving, so 2.0 is the knee.  The remaining
+# misses are median errors (zero-rate and fast-takeoff trophies), not
+# spread, so no wider cap is bought.
+SPARSE_LIMIT = 6
+SIGMA_MAX_SPARSE = 2.0
+SMALL_SAMPLE_COEF = 1.0
 
 # Random-walk coefficient (logit units per sqrt(day)), as in the baseline.
 RW_COEF = 0.5
@@ -86,11 +111,20 @@ RW_COEF = 0.5
 # launch ramp is stale.
 RECENCY_DECAY = 0.7
 
-# Median for a trophy whose last rate is essentially 100%: everyone earns
-# it just by starting, so it stays (nearly) 100% with a tight spread.
+# The (near-)100% starter trophy: everybody earns it just by starting.
+# CERTAIN_RATE / CERTAIN_MEDIAN is the essentially-100% band: the last
+# rate is at the scorer's clamp ceiling in practice, so the median sits
+# there too.  The 99.5-99.95 band keeps the slightly lower 99.9 median.
 NEARLY_ALL_RATE = 99.5
+CERTAIN_RATE = 99.95
 NEARLY_ALL_MEDIAN = 99.9
+CERTAIN_MEDIAN = 99.99
 NEARLY_ALL_SIGMA = 0.2
+
+# Minimum corroboration for the 99.99 median: the trophy must have held
+# >= NEARLY_ALL_RATE in at least this many observations, so one anomalous
+# read can never trigger it.
+CERTAIN_SUPPORT = 2
 
 # Zero-rate prior: a trophy at 0.00% now is a late trophy, not a dead one.
 # Its median is the low end of the rarest trophies that have already
@@ -239,6 +273,35 @@ def last_rate(snapshots, index):
     return None
 
 
+def certain_support(case, snapshots, index):
+    """How many observations corroborate a >= 99.5% rate for this trophy.
+
+    Counts distinct snapshots holding >= NEARLY_ALL_RATE.  When the
+    history is a single frozen page there is only one distinct snapshot
+    by construction, so the corroboration is counted over the raw reads
+    of that page instead: a trophy that reads 100% on every read of a
+    page held for hours is corroborated, while a single anomalous read
+    can never reach CERTAIN_SUPPORT either way.
+    """
+    if len(snapshots) <= 1:
+        count = 0
+        for read in case.get("history") or []:
+            try:
+                rates = read["rates"]
+                value = rates[index] if index < len(rates) else None
+            except (KeyError, TypeError, IndexError):
+                continue
+            if value is not None and value >= NEARLY_ALL_RATE:
+                count += 1
+        return count
+    count = 0
+    for _, _, rates in snapshots:
+        value = rates[index] if index < len(rates) else None
+        if value is not None and value >= NEARLY_ALL_RATE:
+            count += 1
+    return count
+
+
 # --- Per-case forecast -----------------------------------------------------
 
 def forecast_case(case):
@@ -253,6 +316,7 @@ def forecast_case(case):
 
     snapshots = distinct_snapshots(case, release)
     flat = len(snapshots) <= 1
+    n_snaps = len(snapshots)
 
     # Staleness: how old the last distinct snapshot is, in units of the
     # typical gap between distinct snapshots (1.0 when only one gap exists).
@@ -269,8 +333,9 @@ def forecast_case(case):
     for idx, trophy in enumerate(trophies):
         try:
             row = forecast_trophy(
-                idx, trophy, snapshots, flat, x_target, horizon_days,
-                staleness_ratio,
+                idx, trophy, snapshots, flat, n_snaps, x_target,
+                horizon_days, staleness_ratio,
+                certain_support(case, snapshots, idx),
             )
         except Exception:
             # One bad trophy must never fail the whole case.
@@ -282,8 +347,8 @@ def forecast_case(case):
     return {"trophies": rows}
 
 
-def forecast_trophy(idx, trophy, snapshots, flat, x_target, horizon_days,
-                    staleness_ratio):
+def forecast_trophy(idx, trophy, snapshots, flat, n_snaps, x_target,
+                    horizon_days, staleness_ratio, support):
     trophy_id = trophy.get("id", idx + 1)
     rate = last_rate(snapshots, idx)
 
@@ -293,6 +358,8 @@ def forecast_trophy(idx, trophy, snapshots, flat, x_target, horizon_days,
 
     # The (near-)100% starter trophy: everyone earns it on starting.
     if rate >= NEARLY_ALL_RATE:
+        if rate >= CERTAIN_RATE and support >= CERTAIN_SUPPORT:
+            return make_row(trophy_id, CERTAIN_MEDIAN, NEARLY_ALL_SIGMA)
         return make_row(trophy_id, NEARLY_ALL_MEDIAN, NEARLY_ALL_SIGMA)
 
     if flat:
@@ -344,7 +411,10 @@ def forecast_trophy(idx, trophy, snapshots, flat, x_target, horizon_days,
     median_rate = clamp(inv_logit(median_logit), RATE_LO, RATE_HI)
 
     # Spread: random-walk term plus fit-residual variance scaled by
-    # extrapolation leverage, plus staleness.
+    # extrapolation leverage, plus staleness.  With few distinct
+    # snapshots the fit rests on little evidence, so the cap is raised
+    # and a small-sample variance term (proportional to 1/n_snapshots)
+    # is added; with plenty of snapshots both are inert.
     if sxx > 0:
         leverage = 1.0 + ((x_target - x_mean) ** 2) / sxx
     else:
@@ -352,8 +422,13 @@ def forecast_trophy(idx, trophy, snapshots, flat, x_target, horizon_days,
     fit_var = resid_var * min(leverage, 9.0)
     rw_var = (RW_COEF * math.sqrt(horizon_days)) ** 2
     stale_var = 0.05 * min(staleness_ratio, 4.0) ** 2
-    sigma = math.sqrt(rw_var + fit_var + stale_var)
-    sigma = clamp(sigma, SIGMA_MIN, SIGMA_MAX)
+    sigma_cap = SIGMA_MAX
+    small_var = 0.0
+    if n_snaps < SPARSE_LIMIT:
+        sigma_cap = SIGMA_MAX_SPARSE
+        small_var = SMALL_SAMPLE_COEF / max(n_snaps, 1)
+    sigma = math.sqrt(rw_var + fit_var + stale_var + small_var)
+    sigma = clamp(sigma, SIGMA_MIN, sigma_cap)
     return make_row(trophy_id, median_rate, sigma)
 
 
